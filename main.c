@@ -1,94 +1,202 @@
 #include <stdint.h>
-#include <libopencm3/stm32/gpio.h>
-#include <libopencm3/stm32/rcc.h>
-#include <libopencm3/stm32/timer.h>
-#include <libopencmsis/core_cm3.h>
+#include <stm32f10x.h>
 
-void delay(uint32_t ticks) {
-    for (uint32_t i = 0; i < ticks; i++) {
+
+// ==================== ПРОСТАЯ ЗАДЕРЖКА ====================
+static void delay(volatile uint32_t t)
+{
+    while (t--)
+    {
         __NOP();
     }
 }
 
-void TIM2_IRQHandler(void) {
-//void tim2_isr(void) {
-   gpio_toggle(GPIOC, GPIO13);
-   timer_clear_flag(TIM2, TIM_SR_UIF);
+
+// ==================== НАСТРОЙКА SPI1 ====================
+//
+// PA5 - SCK  (SPI1_SCK)
+// PA6 - MISO (SPI1_MISO)
+// PA7 - MOSI (SPI1_MOSI)
+//
+void SPI1_Init(void)
+{
+    // Включаем тактирование SPI1 и порта A
+    RCC->APB2ENR |= RCC_APB2ENR_SPI1EN;
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
+
+    // --- Настраиваем пины SPI1 ---
+
+    // PA5 (SCK) - Альтернативная функция, push-pull, 2 МГц
+    GPIOA->CRL &= ~(GPIO_CRL_MODE5 | GPIO_CRL_CNF5);
+    GPIOA->CRL |=  (GPIO_CRL_MODE5_0 | GPIO_CRL_MODE5_1);
+    GPIOA->CRL |=  (GPIO_CRL_CNF5_1);
+
+    // PA6 (MISO) - Вход, плавающий
+    GPIOA->CRL &= ~(GPIO_CRL_MODE6 | GPIO_CRL_CNF6);
+    GPIOA->CRL |=  (GPIO_CRL_CNF6_0);
+
+    // PA7 (MOSI) - Альтернативная функция, push-pull, 2 МГц
+    GPIOA->CRL &= ~(GPIO_CRL_MODE7 | GPIO_CRL_CNF7);
+    GPIOA->CRL |=  (GPIO_CRL_MODE7_0 | GPIO_CRL_MODE7_1);
+    GPIOA->CRL |=  (GPIO_CRL_CNF7_1);
+
+    // --- Настройка SPI1 ---
+    //
+    // CPOL = 1, CPHA = 1
+    // MSTR = 1 (мастер)
+    // BR   = 111 (fPCLK/256)
+    // SSM  = 1 (программное управление CS)
+    //
+    SPI1->CR1 = 0;
+    SPI1->CR1 |= SPI_CR1_CPOL | SPI_CR1_CPHA;
+    SPI1->CR1 |= SPI_CR1_MSTR;
+    SPI1->CR1 |= SPI_CR1_BR;
+    SPI1->CR1 |= SPI_CR1_SSM | SPI_CR1_SSI;
+
+    // Включаем SPI1
+    SPI1->CR1 |= SPI_CR1_SPE;
 }
 
-int __attribute((noreturn)) main(void) {
-    // Включаем тактирование для AFIO
-    RCC->APB2ENR |= RCC_APB2ENR_AFIOEN;
-    // Включаем тактирование портов C и A
-    RCC->APB2ENR |= RCC_APB2ENR_IOPCEN | RCC_APB2ENR_IOPAEN;
+// Отправка байта по SPI1
+void SPI1_Write(uint8_t data)
+{
+    // Ждем, пока не освободится буфер передатчика
+    while (!(SPI1->SR & SPI_SR_TXE)) {}
 
-    // PC13 как выход push-pull
-    // MODE13 = 01 (output 10 MHz), CNF13 = 00 (general purpose push-pull)
-    GPIOC->CRH = GPIOC->CRH & ~(GPIO_CRH_CNF13 | GPIO_CRH_MODE13) | GPIO_CRH_MODE13_0;
+    // Заполняем буфер передатчика
+    SPI1->DR = data;
 
-    // PA0 как вход с pull-up/down
-    // MODE0 = 00 (input), CNF0 = 10 (input with pull-up/down)
-    GPIOA->CRL = GPIOA->CRL & ~(GPIO_CRL_CNF0 | GPIO_CRL_MODE0) | GPIO_CRL_CNF0_1;
+    // Ждем окончания передачи
+    while (SPI1->SR & SPI_SR_BSY) {}
+}
 
-    // --- PA1 как вход с pull-up/down ---
-    GPIOA->CRL = GPIOA->CRL & ~(GPIO_CRL_CNF1 | GPIO_CRL_MODE1) | GPIO_CRL_CNF1_1;
+// Приём байта по SPI1
+uint8_t SPI1_Read(void)
+{
+    // Запускаем обмен
+    SPI1->DR = 0x00;
 
-    // Включаем подтяжку вверх (pull-up) для PA0 и PA1
-    GPIOA->ODR |= GPIO_ODR_ODR0 | GPIO_ODR_ODR1;
+    // Ждем, пока не появится новое значение в буфере приемника
+    while (!(SPI1->SR & SPI_SR_RXNE)) {}
+
+    // Возвращаем значение буфера приемника
+    return (uint8_t)SPI1->DR;
+}
+
+// =================== ДИСПЛЕЙ SSD1306 ===================
+//
+// PA1 - D/C  (0 = команда, 1 = данные)
+// PA4 - /CS  (0 = активно)
+// PA0 - /RES
+//
 
 
-    // 0 -> 1/64 Гц, 6 -> 1 Гц, 12 -> 64 Гц
-    uint8_t freq_step = 6; // начинаем с 1 Гц
-    const uint8_t MIN_STEP = 0;
-    const uint8_t MAX_STEP = 12;
+#define DISP_RES  GPIO_ODR_ODR0
+#define DISP_DC   GPIO_ODR_ODR1
+#define DISP_CS   GPIO_ODR_ODR4
 
-    // Таблица задержек (половина периода) для частот 1/64 .. 64 Гц
-    const uint32_t delays[13] = {
-        64000000U,
-        32000000U,
-        16000000U,
-        8000000U,
-        4000000U,
-        2000000U,
-        1000000U,
-        500000U,
-        250000U,
-        125000U,
-        62500U,
-        31250U,
-        15625U
-    };
-	// начинаем с 1 Гц (index = 6)
-    uint8_t freq_index = 6;
 
-    while (1) {
-        int a_pressed = !(GPIOA->IDR & GPIO_IDR_IDR0); // Кнопка A (вверх)
-        int c_pressed = !(GPIOA->IDR & GPIO_IDR_IDR1); // Кнопка C (вниз)
+// Отправка КОМАНДЫ в дисплей
+void display_cmd(uint8_t cmd)
+{
+    GPIOA->ODR &= ~DISP_CS;  // CS = 0 (активный)
+    GPIOA->ODR &= ~DISP_DC;  // DC = 0 (команда)
+    delay(1000);
+    SPI1_Write(cmd);
+    GPIOA->ODR |=  DISP_CS;  // CS = 1 (отпустить дисплей)
+}
 
-        // Кнопка A: увеличиваем частоту
-        if (a_pressed) {
-            if (freq_index < 12) {
-                freq_index++;
-            }
-            // Ждём отпускания
-            while (!(GPIOA->IDR & GPIO_IDR_IDR0));
-            // Антидребезг
-            delay(50000);
+// Отправка ДАННЫХ в дисплей
+void display_data(uint8_t data)
+{
+    GPIOA->ODR &= ~DISP_CS;  // CS = 0
+    GPIOA->ODR |=  DISP_DC;  // DC = 1 (данные)
+    delay(1000);
+    SPI1_Write(data);
+    GPIOA->ODR |=  DISP_CS;  // CS = 1
+}
+
+
+// Рестарт дисплея
+void display_reset(void)
+{
+    // /RES = 0 (активный сброс)
+    GPIOA->ODR &= ~DISP_RES;
+    delay(100000);
+
+    // /RES = 1 (нормальная работа)
+    GPIOA->ODR |= DISP_RES;
+    delay(100000);
+}
+
+
+// Включаем горизонтальный режим адресации RAM
+void display_set_horizontal_mode(void)
+{
+    display_cmd(0x20); // команда "Memory addressing mode"
+    display_cmd(0x00); // 0x00 = горизонтальный режим
+}
+
+
+// ================= РИСОВАНИЕ ШАХМАТНОЙ ДОСКИ =================
+//
+// Экран 128x64:
+//  - 8 "страниц" по вертикали (каждая страница = 8 пикселей)
+//  - 128 столбцов.
+//
+void draw_chessboard(void)
+{
+    uint8_t page;
+    uint16_t x;
+
+    display_set_horizontal_mode();
+
+    for (page = 0; page < 8; page++) 
+    {
+        for (x = 0; x < 128; x++)
+        {
+            uint8_t cell_x = x / 16;
+            uint8_t cell_y = page;
+
+            uint8_t color = ((cell_x + cell_y) & 1);
+            uint8_t byte  = color ? 0xFF : 0x00;
+
+            display_data(byte);
         }
-
-        // Кнопка C: уменьшаем частоту
-        if (c_pressed) {
-            if (freq_index > 0) {
-                freq_index--;
-            }
-            while (!(GPIOA->IDR & GPIO_IDR_IDR1));
-            delay(50000);
-        }
-
-		uint32_t delay_ticks = delays[freq_index];
-		GPIOC->ODR &= ~GPIO_ODR_ODR13; // LED ON
-        delay(delay_ticks);
-		GPIOC->ODR |= GPIO_ODR_ODR13;  // LED OFF
-        delay(delay_ticks);
     }
+}
+
+
+int __attribute__((noreturn)) main(void)
+{
+    // Тактирование порта A (для DC/CS)
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
+
+    // PA0 (RES), PA1 (DC) и PA4 (CS) как выходы 2 МГц, push-pull
+    GPIOA->CRL &= ~(GPIO_CRL_MODE0 | GPIO_CRL_CNF0 |
+                    GPIO_CRL_MODE1 | GPIO_CRL_CNF1 |
+                    GPIO_CRL_MODE4 | GPIO_CRL_CNF4);
+
+    GPIOA->CRL |= GPIO_CRL_MODE0_1;   // PA0: 2 МГц
+    GPIOA->CRL |= GPIO_CRL_MODE1_1;   // PA1: 2 МГц
+    GPIOA->CRL |= GPIO_CRL_MODE4_1;   // PA4: 2 МГц
+
+    // Начальное состояние: RES=1, DC=0, CS=1
+    GPIOA->ODR |=  DISP_RES;   // /RES высоко (не в сбросе)
+    GPIOA->ODR &= ~DISP_DC;    // командный режим
+    GPIOA->ODR |=  DISP_CS;    // дисплей не выбран
+
+    // Инициализация SPI1 (часть "библиотеки")
+    SPI1_Init();
+    
+    // Аппаратный сброс дисплея
+    display_reset();
+
+    // Пример команды включения дисплея
+    uint8_t display_on = 1;
+    display_cmd(0xAE | display_on);  // 0xAF = Display ON
+
+    draw_chessboard();
+
+    while (1) {}
 }
