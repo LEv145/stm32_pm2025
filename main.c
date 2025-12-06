@@ -1,10 +1,19 @@
 #include <stdint.h>
-#include <stm32f10x.h>
+#include <libopencm3/stm32/gpio.h>
+#include <libopencm3/stm32/rcc.h>
+#include <libopencm3/stm32/timer.h>
+#include <libopencmsis/core_cm3.h>
 
 void delay(uint32_t ticks) {
     for (uint32_t i = 0; i < ticks; i++) {
         __NOP();
     }
+}
+
+void TIM2_IRQHandler(void) {
+//void tim2_isr(void) {
+   gpio_toggle(GPIOC, GPIO13);
+   timer_clear_flag(TIM2, TIM_SR_UIF);
 }
 
 int __attribute((noreturn)) main(void) {
